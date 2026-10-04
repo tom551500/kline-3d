@@ -1,18 +1,21 @@
+from streamlit_lightweight_charts import renderLightweightCharts
 import datetime as dt
 
 import pandas as pd
-import plotly.graph_objects as go
 import requests
 import streamlit as st
-from plotly.subplots import make_subplots
 
 st.set_page_config(page_title="3日K線", layout="wide")
-st.title("📈 台股 3日K 線（FinMind）")
+st.title("📈 台股 3日K 線（FinMind · TradingView 風格）")
 
 API_URL = "https://api.finmindtrade.com/api/v4/data"
 
-RED = "#e53935"  # 台股：紅漲
+RED = "#e53935"    # 台股：紅漲
 GREEN = "#00a152"  # 綠跌
+BG = "#131722"
+GRID = "#1e222d"
+TEXT = "#d1d4dc"
+BORDER = "#2b2b43"
 
 
 # ---------------------------------------------------------------- 資料
@@ -116,8 +119,30 @@ def _who(name: str) -> str:
     return "自營商"
 
 
-def _fmt(v, digits: int = 2) -> str:
-    return "-" if pd.isna(v) else f"{v:.{digits}f}"
+# ---------------------------------------------------------------- lightweight-charts 小工具
+def line_series(times, values, color, title, width=1.3):
+    data = [{"time": t, "value": float(v)} for t, v in zip(times, values) if pd.notna(v)]
+    return {"type": "Line", "data": data, "options": {"color": color, "lineWidth": width, "title": title}}
+
+
+def hist_series(times, values, color, title):
+    data = [{"time": t, "value": float(v)} for t, v in zip(times, values) if pd.notna(v)]
+    return {"type": "Histogram", "data": data, "options": {"color": color, "title": title}}
+
+
+def base_chart_options(height: int, show_time_labels: bool = True):
+    return {
+        "layout": {"background": {"type": "solid", "color": BG}, "textColor": TEXT},
+        "grid": {"vertLines": {"color": GRID}, "horzLines": {"color": GRID}},
+        "crosshair": {"mode": 0},
+        "timeScale": {
+            "borderColor": BORDER,
+            "timeVisible": False,
+            "visible": show_time_labels,
+        },
+        "rightPriceScale": {"borderColor": BORDER},
+        "height": height,
+    }
 
 
 # ---------------------------------------------------------------- 側邊欄（第一段）
@@ -182,9 +207,12 @@ if show_inst:
         piv = piv[["外資", "投信", "自營商"]].rolling(int(n), min_periods=1).sum()
         inst = piv.reindex(pd.Index(k["date"])).reset_index(drop=True)
 
-# 除權息日
-ex_x, ex_y, ex_txt = [], [], []
-x = k["date"].dt.strftime("%Y-%m-%d")  # 用類別軸，自動跳過假日空檔
+# 時間軸（字串格式，lightweight-charts 用）
+times = k["date"].dt.strftime("%Y-%m-%d").tolist()
+
+# 除權息日 → 轉成 markers
+ex_markers = []
+ex_details = []
 if show_exdiv:
     ed = safe_fetch("TaiwanStockDividendResult", "除權息資料")
     if not ed.empty and "date" in ed.columns:
@@ -198,13 +226,22 @@ if show_exdiv:
                 v = r.get(col)
                 return "-" if v is None or pd.isna(v) else v
 
-            ex_x.append(x.iloc[idx])
-            ex_y.append(float(k["high"].iloc[idx]) * 1.015)
-            ex_txt.append(
-                f"<b>除權息日 {r['date']:%Y-%m-%d}</b><br>"
-                f"除權息前收盤 {g('before_price')}<br>"
-                f"參考價 {g('after_price')}<br>"
-                f"權值＋息值 {g('stock_and_cache_dividend')}"
+            ex_markers.append(
+                {
+                    "time": times[idx],
+                    "position": "aboveBar",
+                    "color": "#ab47bc",
+                    "shape": "circle",
+                    "text": "除",
+                }
+            )
+            ex_details.append(
+                {
+                    "日期": r["date"].strftime("%Y-%m-%d"),
+                    "除權息前收盤": g("before_price"),
+                    "參考價": g("after_price"),
+                    "權值＋息值": g("stock_and_cache_dividend"),
+                }
             )
 
 # ---------------------------------------------------------------- 側邊欄（第二段：盈虧比）
@@ -242,219 +279,89 @@ def net_pnl(exit_price: float) -> float:
     return gross - fees - tax
 
 
-# ---------------------------------------------------------------- 滑鼠提示文字
-prev_close = k["close"].shift(1)
-chg = (k["close"] - prev_close) / prev_close * 100
+# ---------------------------------------------------------------- 組圖表資料
+candle_data = [
+    {"time": t, "open": float(o), "high": float(h), "low": float(l), "close": float(c)}
+    for t, o, h, l, c in zip(times, k["open"], k["high"], k["low"], k["close"])
+]
 
-hover = []
-for i in range(len(k)):
-    c = chg.iloc[i]
-    c_txt = "-" if pd.isna(c) else f"{c:+.2f}%"
-    lines = [
-        f"<b>{x.iloc[i]}</b>",
-        f"開 {k['open'].iloc[i]:.2f}　高 {k['high'].iloc[i]:.2f}",
-        f"低 {k['low'].iloc[i]:.2f}　收 {k['close'].iloc[i]:.2f}",
-        f"漲跌 {c_txt}",
-        f"量 {k['volume'].iloc[i] / 1000:,.0f} 張",
-        f"MA5 {_fmt(k['MA5'].iloc[i])}　MA10 {_fmt(k['MA10'].iloc[i])}",
-        f"MA20 {_fmt(k['MA20'].iloc[i])}",
+candle_options = {
+    "upColor": RED,
+    "downColor": GREEN,
+    "borderVisible": False,
+    "wickUpColor": RED,
+    "wickDownColor": GREEN,
+}
+
+price_lines = []
+if show_rr_lines and rr_valid:
+    price_lines = [
+        {"price": entry, "color": "#90a4ae", "lineWidth": 1, "lineStyle": 2, "axisLabelVisible": True, "title": f"進場 {entry:.2f}"},
+        {"price": stop, "color": "#ef5350", "lineWidth": 1, "lineStyle": 2, "axisLabelVisible": True, "title": f"停損 {stop:.2f}"},
+        {"price": target, "color": "#26a69a", "lineWidth": 1, "lineStyle": 2, "axisLabelVisible": True, "title": f"目標 {target:.2f}"},
     ]
-    if kd is not None:
-        lines.append(f"K {_fmt(kd['K'].iloc[i], 1)}　D {_fmt(kd['D'].iloc[i], 1)}")
-    if macd is not None:
-        lines.append(
-            f"DIF {_fmt(macd['DIF'].iloc[i])}　MACD {_fmt(macd['MACD'].iloc[i])}　柱 {_fmt(macd['OSC'].iloc[i])}"
-        )
-    if inst is not None:
-        lines.append(
-            f"外資 {inst['外資'].iloc[i]:,.0f}　投信 {inst['投信'].iloc[i]:,.0f}　自營 {inst['自營商'].iloc[i]:,.0f}（張）"
-        )
-    hover.append("<br>".join(lines))
 
-# ---------------------------------------------------------------- 圖表
-panels = ["price", "vol"]
-if kd is not None:
-    panels.append("kd")
-if macd is not None:
-    panels.append("macd")
-if inst is not None:
-    panels.append("inst")
-row_of = {p: i + 1 for i, p in enumerate(panels)}
-weights = {"price": 3.0, "vol": 1.0, "kd": 1.2, "macd": 1.2, "inst": 1.2}
-w_sum = sum(weights[p] for p in panels)
+candlestick_series = {
+    "type": "Candlestick",
+    "data": candle_data,
+    "options": candle_options,
+}
+if ex_markers:
+    candlestick_series["markers"] = ex_markers
+if price_lines:
+    candlestick_series["priceLines"] = price_lines
 
-fig = make_subplots(
-    rows=len(panels),
-    cols=1,
-    shared_xaxes=True,
-    vertical_spacing=0.02,
-    row_heights=[weights[p] / w_sum for p in panels],
-)
-
-# 價格區
-fig.add_trace(
-    go.Candlestick(
-        x=x,
-        open=k["open"],
-        high=k["high"],
-        low=k["low"],
-        close=k["close"],
-        text=hover,
-        hoverinfo="text",
-        name=f"{int(n)}日K",
-        increasing_line_color=RED,
-        increasing_fillcolor=RED,
-        decreasing_line_color=GREEN,
-        decreasing_fillcolor=GREEN,
-    ),
-    row=1,
-    col=1,
-)
+price_series = [candlestick_series]
 if show_ma:
     for w, c in zip((5, 10, 20), ("#fb8c00", "#1e88e5", "#8e24aa")):
-        fig.add_trace(
-            go.Scatter(x=x, y=k[f"MA{w}"], name=f"MA{w}", line=dict(width=1.2, color=c), hoverinfo="skip"),
-            row=1,
-            col=1,
-        )
-if ex_x:
-    fig.add_trace(
-        go.Scatter(
-            x=ex_x,
-            y=ex_y,
-            mode="markers+text",
-            text=["除"] * len(ex_x),
-            textposition="top center",
-            textfont=dict(size=11, color="#6a1b9a"),
-            marker=dict(symbol="triangle-down", size=9, color="#6a1b9a"),
-            hovertext=ex_txt,
-            hoverinfo="text",
-            name="除權息",
-        ),
-        row=1,
-        col=1,
-    )
+        price_series.append(line_series(times, k[f"MA{w}"], c, f"MA{w}"))
 
-if show_rr_lines and rr_valid:
-    for price, label, color in (
-        (entry, "進場", "#546e7a"),
-        (stop, "停損", "#d32f2f"),
-        (target, "目標", "#2e7d32"),
-    ):
-        fig.add_hline(
-            y=price,
-            row=1,
-            col=1,
-            line=dict(color=color, width=1.2, dash="dash"),
-            annotation_text=f"{label} {price:.2f}",
-            annotation_position="right",
-            annotation_font_color=color,
-        )
-
-# 成交量
 vol_colors = [RED if c >= o else GREEN for o, c in zip(k["open"], k["close"])]
-fig.add_trace(
-    go.Bar(
-        x=x,
-        y=k["volume"] / 1000,
-        marker_color=vol_colors,
-        name="成交量",
-        showlegend=False,
-        hovertemplate="量 %{y:,.0f} 張<extra></extra>",
-    ),
-    row=row_of["vol"],
-    col=1,
-)
+volume_data = [
+    {"time": t, "value": float(v) / 1000, "color": col}
+    for t, v, col in zip(times, k["volume"], vol_colors)
+]
+volume_series = [{"type": "Histogram", "data": volume_data, "options": {"priceFormat": {"type": "volume"}}}]
 
-# KD
+charts = [
+    {"chart": base_chart_options(420), "series": price_series},
+    {"chart": base_chart_options(130), "series": volume_series},
+]
+
 if kd is not None:
-    r_ = row_of["kd"]
-    fig.add_trace(
-        go.Scatter(x=x, y=kd["K"], name="K", line=dict(width=1.3, color="#fb8c00"), hovertemplate="K %{y:.1f}<extra></extra>"),
-        row=r_,
-        col=1,
-    )
-    fig.add_trace(
-        go.Scatter(x=x, y=kd["D"], name="D", line=dict(width=1.3, color="#1e88e5"), hovertemplate="D %{y:.1f}<extra></extra>"),
-        row=r_,
-        col=1,
-    )
-    for lv in (20, 80):
-        fig.add_hline(y=lv, row=r_, col=1, line=dict(color="#90a4ae", width=1, dash="dot"))
-    fig.update_yaxes(range=[0, 100], row=r_, col=1)
+    kd_series = [
+        line_series(times, kd["K"], "#fb8c00", "K"),
+        line_series(times, kd["D"], "#1e88e5", "D"),
+    ]
+    charts.append({"chart": base_chart_options(150), "series": kd_series})
 
-# MACD
 if macd is not None:
-    r_ = row_of["macd"]
     osc_colors = [RED if v >= 0 else GREEN for v in macd["OSC"].fillna(0)]
-    fig.add_trace(
-        go.Bar(x=x, y=macd["OSC"], marker_color=osc_colors, name="柱狀體", showlegend=False, hovertemplate="柱 %{y:.2f}<extra></extra>"),
-        row=r_,
-        col=1,
-    )
-    fig.add_trace(
-        go.Scatter(x=x, y=macd["DIF"], name="DIF", line=dict(width=1.2, color="#1e88e5"), hovertemplate="DIF %{y:.2f}<extra></extra>"),
-        row=r_,
-        col=1,
-    )
-    fig.add_trace(
-        go.Scatter(x=x, y=macd["MACD"], name="MACD", line=dict(width=1.2, color="#fb8c00"), hovertemplate="MACD %{y:.2f}<extra></extra>"),
-        row=r_,
-        col=1,
-    )
+    osc_data = [{"time": t, "value": float(v), "color": c} for t, v, c in zip(times, macd["OSC"], osc_colors)]
+    macd_series = [
+        {"type": "Histogram", "data": osc_data, "options": {"title": "柱狀體"}},
+        line_series(times, macd["DIF"], "#1e88e5", "DIF"),
+        line_series(times, macd["MACD"], "#fb8c00", "MACD"),
+    ]
+    charts.append({"chart": base_chart_options(150), "series": macd_series})
 
-# 三大法人
 if inst is not None:
-    r_ = row_of["inst"]
-    for who, col in (("外資", "#1e88e5"), ("投信", "#fb8c00"), ("自營商", "#8e24aa")):
-        fig.add_trace(
-            go.Bar(x=x, y=inst[who], name=who, marker_color=col, hovertemplate=f"{who} %{{y:,.0f}} 張<extra></extra>"),
-            row=r_,
-            col=1,
-        )
+    inst_series = [
+        line_series(times, inst["外資"], "#1e88e5", "外資", width=1.6),
+        line_series(times, inst["投信"], "#fb8c00", "投信", width=1.6),
+        line_series(times, inst["自營商"], "#8e24aa", "自營商", width=1.6),
+    ]
+    charts.append({"chart": base_chart_options(150), "series": inst_series})
 
-spike = dict(
-    showspikes=True,
-    spikemode="across",
-    spikesnap="cursor",
-    spikethickness=1,
-    spikedash="dot",
-    spikecolor="#78909c",
-)
-fig.update_xaxes(type="category", rangeslider_visible=False, nticks=12, **spike)
-fig.update_yaxes(**spike)
-fig.update_yaxes(title_text="價格", row=1, col=1)
-fig.update_yaxes(title_text="量(張)", row=row_of["vol"], col=1)
-if kd is not None:
-    fig.update_yaxes(title_text="KD", row=row_of["kd"], col=1)
-if macd is not None:
-    fig.update_yaxes(title_text="MACD", row=row_of["macd"], col=1)
-if inst is not None:
-    fig.update_yaxes(title_text="法人(張)", row=row_of["inst"], col=1)
+st.caption("🖱️ 拖曳平移、滾輪縮放、滑鼠移到圖上會顯示十字線與對應數值；各面板時間軸同步連動。")
+renderLightweightCharts(charts, key="multipane")
 
-extra_panels = len(panels) - 2
-fig.update_layout(
-    height=560 + 190 * extra_panels,
-    dragmode="pan",
-    hovermode="x",
-    barmode="relative",
-    hoverlabel=dict(align="left", font_size=13),
-    margin=dict(l=10, r=10, t=30, b=10),
-    legend=dict(orientation="h", y=1.02),
-    newshape=dict(line=dict(color="#ff6f00", width=2)),
-)
-
-chart_config = {
-    "scrollZoom": False,  # 關閉滾輪縮放，避免誤觸
-    "doubleClick": "reset",  # 連點兩下回到完整範圍
-    "displaylogo": False,
-    "modeBarButtonsToAdd": ["drawline", "drawopenpath", "drawrect", "eraseshape"],
-    "modeBarButtonsToRemove": ["select2d", "lasso2d"],
-}
-st.caption("🖱️ 預設為拖曳平移；要縮放請點工具列的放大鏡。滑鼠連點兩下可回到完整範圍。工具列可畫線、刪除選取的線。")
-st.plotly_chart(fig, width="stretch", config=chart_config)
 if inst is not None:
     st.caption(f"三大法人為「最近 {int(n)} 個交易日」合計的買賣超（張），與 K 棒同一期間；最新一天的資料可能尚未公布。")
+
+if ex_details:
+    with st.expander("查看除權息明細"):
+        st.dataframe(pd.DataFrame(ex_details), width="stretch")
 
 # ---------------------------------------------------------------- 盈虧比結果
 st.subheader(f"🧮 {direction} 盈虧比（{stock_id}，{int(lots)} 張）")
