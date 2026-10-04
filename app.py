@@ -97,6 +97,40 @@ if k.empty:
 for w in (5, 10, 20):
     k[f"MA{w}"] = k["close"].rolling(w).mean()
 
+# ---------------- 開單盈虧比計算 ----------------
+last_close = float(daily["close"].iloc[-1])
+with st.sidebar:
+    st.markdown("---")
+    st.subheader("🧮 開單盈虧比")
+    direction = st.radio("方向", ["開多", "開空"], horizontal=True)
+    entry = st.number_input("進場價", value=last_close, step=0.05, format="%.2f", key=f"entry_{stock_id}")
+    if direction == "開多":
+        def_stop, def_target = last_close * 0.95, last_close * 1.10
+    else:
+        def_stop, def_target = last_close * 1.05, last_close * 0.90
+    stop = st.number_input("停損價", value=round(def_stop, 2), step=0.05, format="%.2f", key=f"stop_{stock_id}_{direction}")
+    target = st.number_input("目標價", value=round(def_target, 2), step=0.05, format="%.2f", key=f"target_{stock_id}_{direction}")
+    lots = st.number_input("張數", min_value=1, value=1, step=1)
+    fee_disc = st.number_input("手續費折數（折）", min_value=0.1, max_value=10.0, value=2.8, step=0.1)
+    tax_rate = st.number_input("證交稅率 (%)", min_value=0.0, value=0.3, step=0.05, format="%.2f") / 100
+    show_rr_lines = st.checkbox("在圖上畫出進場/停損/目標線", value=True)
+
+shares = int(lots) * 1000
+is_long = direction == "開多"
+rr_valid = (stop < entry < target) if is_long else (target < entry < stop)
+
+risk_ps = (entry - stop) if is_long else (stop - entry)
+reward_ps = (target - entry) if is_long else (entry - target)
+
+
+def net_pnl(exit_price: float) -> float:
+    gross = (exit_price - entry) * shares if is_long else (entry - exit_price) * shares
+    fee_rate = 0.001425 * fee_disc / 10
+    fees = (entry + exit_price) * shares * fee_rate
+    sell_value = (exit_price if is_long else entry) * shares  # 賣出那一邊課證交稅
+    tax = sell_value * tax_rate
+    return gross - fees - tax
+
 x = k["date"].dt.strftime("%Y-%m-%d")  # 用類別軸，自動跳過假日空檔
 
 # 滑鼠移過去顯示的資訊（開高低收、漲跌幅、成交量、均線）
@@ -161,6 +195,7 @@ spike = dict(
 )
 fig.update_layout(
     height=640,
+    dragmode="pan",
     hovermode="x",
     hoverlabel=dict(align="left", font_size=13),
     xaxis=dict(type="category", rangeslider=dict(visible=False), nticks=12, **spike),
@@ -170,13 +205,54 @@ fig.update_layout(
     newshape=dict(line=dict(color="#ff6f00", width=2)),
 )
 
+if show_rr_lines and rr_valid:
+    for price, label, color in (
+        (entry, "進場", "#546e7a"),
+        (stop, "停損", "#d32f2f"),
+        (target, "目標", "#2e7d32"),
+    ):
+        fig.add_hline(
+            y=price,
+            line=dict(color=color, width=1.2, dash="dash"),
+            annotation_text=f"{label} {price:.2f}",
+            annotation_position="right",
+            annotation_font_color=color,
+        )
+
 chart_config = {
-    "scrollZoom": True,  # 滾輪縮放
+    "scrollZoom": False,  # 關閉滾輪縮放，避免誤觸
+    "doubleClick": "reset",  # 連點兩下回到完整範圍
     "displaylogo": False,
     "modeBarButtonsToAdd": ["drawline", "drawopenpath", "drawrect", "eraseshape"],
+    "modeBarButtonsToRemove": ["select2d", "lasso2d"],
 }
-st.caption("🖱️ 工具列：畫直線 / 自由畫線 / 畫矩形 / 刪除選取的線（點線後按刪除）；滾輪可縮放，拖曳可平移。")
+st.caption("🖱️ 預設為拖曳平移；要縮放請點工具列的放大鏡。滑鼠連點兩下可回到完整範圍。工具列可畫線、刪除選取的線。")
 st.plotly_chart(fig, use_container_width=True, config=chart_config)
+
+# ---------------- 盈虧比結果 ----------------
+st.subheader(f"🧮 {direction} 盈虧比（{stock_id}，{int(lots)} 張）")
+if not rr_valid:
+    if is_long:
+        st.warning("開多需要：停損價 < 進場價 < 目標價，請調整側邊欄的價格。")
+    else:
+        st.warning("開空需要：目標價 < 進場價 < 停損價，請調整側邊欄的價格。")
+else:
+    profit = net_pnl(target)
+    loss = -net_pnl(stop)  # 以正數表示虧損金額
+    gross_rr = reward_ps / risk_ps
+    net_rr = profit / loss if loss > 0 else float("inf")
+    breakeven = 1 / (1 + net_rr) * 100 if net_rr != float("inf") else 0.0
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("盈虧比（未含成本）", f"1 : {gross_rr:.2f}")
+    c2.metric("盈虧比（扣手續費稅）", f"1 : {net_rr:.2f}")
+    c3.metric("達標淨獲利", f"{profit:,.0f} 元", f"+{reward_ps / entry * 100:.2f}%")
+    c4.metric("停損淨虧損", f"-{loss:,.0f} 元", f"-{risk_ps / entry * 100:.2f}%", delta_color="inverse")
+    st.caption(f"損益兩平勝率約 {breakeven:.1f}%（勝率高於此值，長期期望值才為正）。")
+    st.caption(
+        "試算已扣手續費（買賣各一次）與證交稅（賣出那一邊）；開空另有融券利息／借券費，此處未計入。"
+        "此工具僅為試算，不構成投資建議。"
+    )
 
 vol = go.Figure(go.Bar(x=x, y=k["volume"] / 1000, marker_color="#90a4ae"))
 vol.update_layout(
